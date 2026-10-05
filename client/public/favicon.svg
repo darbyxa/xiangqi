@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <circle cx="32" cy="32" r="30" fill="#b82426" stroke="#c9a24b" stroke-width="3"/>
+  <circle cx="32" cy="32" r="24" fill="none" stroke="#e6c773" stroke-width="1.2" opacity=".7"/>
+  <text x="32" y="44" text-anchor="middle" font-size="34" font-family="'Noto Serif SC','Songti SC','SimSun',serif" fill="#fff">帥</text>
+</svg>
