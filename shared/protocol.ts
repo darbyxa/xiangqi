@@ -120,15 +120,36 @@ export interface Notice {
   message: string;
 }
 
+/** A browser's Web Push subscription (PushSubscription.toJSON()), used to notify a player who isn't looking. */
+export interface PushSubscriptionData {
+  endpoint: string;
+  keys: { p256dh: string; auth: string };
+}
+
+/** What the service worker receives in a push and turns into a system notification. */
+export interface PushMessage {
+  title: string;
+  body: string;
+  /** notifications with the same tag replace each other (one per room) */
+  tag: string;
+  /** page to open when the notification is tapped */
+  url: string;
+}
+
 export interface ClientToServerEvents {
   'room:create': (p: { name?: string }, ack: (r: Ack<JoinData>) => void) => void;
   'room:join': (p: { code: string; name?: string }, ack: (r: Ack<JoinData>) => void) => void;
   'room:rejoin': (p: { code: string; token: string }, ack: (r: Ack<JoinData>) => void) => void;
   'room:leave': (ack: (r: Ack) => void) => void;
+  /** step away from a game WITHOUT resigning (it can be resumed later from the lobby) */
+  'room:park': (ack: (r: Ack) => void) => void;
   'game:move': (p: { from: number; to: number }, ack: (r: Ack) => void) => void;
   'game:resign': (ack: (r: Ack) => void) => void;
   'game:restart:request': (ack: (r: Ack) => void) => void;
   'game:restart:respond': (p: { accept: boolean }, ack: (r: Ack) => void) => void;
+  /** notify this seat (on this device) when it's their move */
+  'push:subscribe': (p: { subscription: PushSubscriptionData }, ack: (r: Ack) => void) => void;
+  'push:unsubscribe': (p: { endpoint: string }, ack: (r: Ack) => void) => void;
 }
 
 export interface ServerToClientEvents {

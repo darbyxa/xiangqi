@@ -18,6 +18,9 @@ export default function App() {
         onRestart={() => void s.requestRestart()}
         onRespond={(accept) => void s.respondRestart(accept)}
         onLeave={() => void s.leaveRoom()}
+        onPark={() => void s.parkRoom()}
+        notifications={s.notifications}
+        onToggleNotifications={() => void s.toggleNotifications()}
         notify={(text) => void s.notify(text)}
       />
     );
@@ -36,9 +39,9 @@ export default function App() {
         serverUrl={s.serverUrl}
         onCreate={s.createRoom}
         onJoin={s.joinRoom}
-        resumable={s.resumable}
+        games={s.games}
         onResume={s.resumeGame}
-        onDismissResume={s.dismissResumable}
+        onForget={s.forgetGame}
       />
     );
   }

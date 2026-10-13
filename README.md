@@ -8,6 +8,20 @@ React + TypeScript client · Node.js + Express server · Socket.IO (WebSockets) 
 
 ---
 
+## Play in one step
+
+| Hosting device | Run | Guide |
+|---|---|---|
+| Windows laptop | double-click **`play_windows.bat`** | [below](#playing-between-two-laptops-with-ngrok) |
+| Android phone | `bash play_android.sh` in Termux | **[README-ANDROID.md](README-ANDROID.md)** |
+
+One device hosts. The script installs what's missing (Node.js, ngrok), builds the game, starts the server and an
+ngrok tunnel, then prints a link and a QR code. The other player only needs a browser: phone ↔ phone,
+laptop ↔ phone and laptop ↔ laptop all work. Games are saved, so either player can close the app and carry on
+later. Tap **Notify me** to get a push notification when your opponent moves.
+
+---
+
 ## Features
 
 - **Rooms** – create a game and get a 6-character code (`K7XM2P`); a second player enters it to join. Exactly two players per room, a third is turned away.
@@ -16,7 +30,9 @@ React + TypeScript client · Node.js + Express server · Socket.IO (WebSockets) 
 - **Complete Xiangqi rules** – all seven piece types, horse-leg and elephant-eye blocking, cannon screens, river boundary, palace confinement, check, checkmate, stalemate (a loss in Xiangqi), the flying-general rule, pins, perpetual check, threefold repetition and the 60-move no-capture draw.
 - **Game UI** – whose turn it is, check warning, captured pieces for both sides, move history in traditional notation (炮二平五), last-move markers, win/loss/draw banner, per-room scoreboard.
 - **Resign and restart** – resigning is immediate (with a confirm dialog); restarting needs the opponent's consent.
-- **Disconnect / reconnect** – refresh the page or lose your connection and you land back in your seat with the game intact. The opponent sees a live countdown; if you don't return within the grace period (90 s by default) you forfeit.
+- **Play over days** – close the page, or stop the server entirely, and pick the game up later. Games are saved to `server/data/rooms.json`, and the lobby lists **Your games** with whose move it is. Nobody forfeits for being away (an optional grace period can turn that back on).
+- **Move notifications** – Web Push: with **Notify me** on, your phone or laptop shows *"Your move — Alice played 炮八平五"* even when the game is closed. Tapping it opens the game.
+- **Installable** – on Android, Chrome's *Add to Home screen* gives the game its own icon and full-screen window.
 - **Responsive, traditional look** – dark burgundy lacquer, gold accents, parchment board in a rosewood frame, lacquered discs using the supplied piece artwork. Laptop, tablet and phone layouts.
 
 | | |
@@ -46,11 +62,13 @@ xiangqi-online/
 │   │   │   ├── XiangqiGame.ts  one match: turns, history, captures, mate/repetition/draw detection
 │   │   │   └── notation.ts   traditional move notation
 │   │   ├── rooms/
-│   │   │   └── RoomService.ts  rooms, seats, tokens, reconnect/forfeit timers, rematch, cleanup
+│   │   │   ├── RoomService.ts  rooms, seats, tokens, reconnect/forfeit timers, rematch, cleanup, snapshots
+│   │   │   └── RoomStore.ts    saves every room to server/data/rooms.json (debounced, atomic)
+│   │   ├── push/WebPush.ts     "your move" push notifications (VAPID keys in server/data)
 │   │   ├── socket/
 │   │   │   └── registerHandlers.ts  socket events → RoomService (validates every payload)
 │   │   └── utils/roomCode.ts
-│   └── tests/                48 tests (rules, game flow, rooms, real-socket integration)
+│   └── tests/                56 tests (rules, game flow, rooms, saving, push, real-socket integration)
 └── client/                   React + TypeScript + Vite
     ├── package.json
     ├── tsconfig.json
@@ -58,11 +76,12 @@ xiangqi-online/
     ├── index.html
     ├── .env.example          ← copy to .env
     ├── public/
-    │   ├── favicon.svg
+    │   ├── favicon.svg · manifest.webmanifest · icons/
+    │   ├── sw.js             service worker: shows push notifications, opens the game when tapped
     │   └── pieces/           your artwork: disc-red/black.png and 14 character SVGs
     └── src/
         ├── main.tsx · App.tsx · styles.css
-        ├── lib/              socket.ts · session.ts · pieces.ts · geometry.ts · result.ts · clipboard.ts
+        ├── lib/              socket.ts · session.ts (saved games) · push.ts · pieces.ts · geometry.ts · result.ts · clipboard.ts
         ├── hooks/            useGameSession.ts (connection + state) · usePieceIds.ts · useNow.ts
         └── components/       Lobby · GameScreen · Board · PieceIcon · PlayerCard · CapturedRow ·
                               MoveHistory · ResultBanner · ConfirmDialog · Toasts
@@ -105,12 +124,16 @@ cp client/.env.example client/.env
 | `npm run dev` | server (auto-reload) + client (hot reload) together |
 | `npm run build` | production build of the client into `client/dist` |
 | `npm start` | starts the server; if `client/dist` exists it serves the game on the same port |
-| `npm test` | runs the 48 server tests |
+| `npm test` | runs the 56 server tests |
 | `npm run typecheck` | TypeScript check for server and client |
 
 ---
 
 ## Playing between two laptops with ngrok
+
+**Easiest:** double-click `play_windows.bat` (or run `node scripts/host.mjs` after `npm install && npm run build`).
+It performs Option A below for you: it installs ngrok, asks once for your authtoken, starts the server and the
+tunnel, and opens the public link. Set `NGROK_DOMAIN` in `server/.env` to pin the link to your free ngrok domain.
 
 The server can serve the built React app *and* the WebSocket from one port, so **one ngrok tunnel is enough**.
 
@@ -182,9 +205,14 @@ When the server starts it prints its LAN address (for example `http://192.168.1.
 | `HOST` | `0.0.0.0` | interface to bind (`0.0.0.0` makes it reachable from other devices / ngrok) |
 | `CLIENT_ORIGINS` | `localhost:5173`, `127.0.0.1:5173`, `https://*.ngrok-free.app`, `…ngrok-free.dev`, `…ngrok.app`, `…ngrok.io` | comma-separated browser origins allowed to connect. `*.` wildcards work for subdomains; `*` allows everything (testing only). Not used when the page is served by the server itself. |
 | `SERVE_CLIENT` | `true` | serve `client/dist` from the same port |
-| `RECONNECT_GRACE_SECONDS` | `90` | how long a disconnected player has to return before forfeiting (`0` = never) |
-| `ROOM_TTL_MINUTES` | `60` | abandoned rooms (nobody connected) are deleted after this long |
+| `RECONNECT_GRACE_SECONDS` | `0` | how long a disconnected player has to return before forfeiting (`0` = never; right for play over days) |
+| `ROOM_TTL_MINUTES` | `43200` (30 days) | rooms with nobody connected are deleted this long after their last activity |
 | `RANDOM_COLORS` | `true` | `false` makes the room creator always Red |
+| `SAVE_GAMES` | `true` | save rooms to disk so games survive a restart |
+| `DATA_DIR` | `data` | where saved games and push keys live (relative to `server/`) |
+| `PUSH_NOTIFICATIONS` | `true` | Web Push "your move" notifications |
+| `VAPID_SUBJECT` | `mailto:xiangqi@example.com` | contact address the push services see (`mailto:` or `https:`) |
+| `NGROK_DOMAIN` | *(empty)* | used by `scripts/host.mjs`: your reserved ngrok domain, so the link never changes |
 
 ### `client/.env`
 
@@ -224,6 +252,9 @@ When the server starts it prints its LAN address (for example `http://192.168.1.
 | `room:join` | `{ code, name }` | `ROOM_NOT_FOUND`, `ROOM_FULL`, `INVALID_CODE` |
 | `room:rejoin` | `{ code, token }` | reclaim your seat after a refresh/reconnect |
 | `room:leave` | – | leaving a game in progress counts as a resignation |
+| `room:park` | – | back to the lobby *without* resigning; the seat is kept for `room:rejoin` |
+| `push:subscribe` | `{ subscription }` | notify this seat on this device (only known push services accepted) |
+| `push:unsubscribe` | `{ endpoint }` | |
 | `game:move` | `{ from, to }` | `NOT_YOUR_TURN`, `ILLEGAL_MOVE`, `GAME_NOT_ACTIVE` |
 | `game:resign` | – | |
 | `game:restart:request` / `:respond` | `{ accept }` | restart needs the opponent's consent; colours swap |
@@ -236,13 +267,13 @@ When the server starts it prints its LAN address (for example `http://192.168.1.
 
 Every client → server event is acknowledged with `{ ok: true, … }` or `{ ok: false, error, message }`.
 
-### Reconnection
+### Saving, resuming and notifications
 
-- On create/join the server hands out a secret **seat token**. The browser keeps it in `sessionStorage`, so a refresh or a dropped connection reclaims the same seat via `room:rejoin`.
-- When a socket drops, the seat is kept, the opponent sees *"Offline – forfeits in 1:23"* and a timer starts. Returning in time cancels it; otherwise the game is awarded to the opponent (`RECONNECT_GRACE_SECONDS`).
-- If a tab is closed, the lobby of a fresh tab offers an opt-in **Resume game** button (for up to an hour).
+- On create/join the server hands out a secret **seat token**. The tab keeps it in `sessionStorage` (refresh = straight back in), and `localStorage` keeps a list of **every** game this browser plays, shown in the lobby as *Your games*.
+- When a socket drops the seat is kept and the opponent sees *Offline*. With the default `RECONNECT_GRACE_SECONDS=0` nobody forfeits; set it above 0 for a live-play countdown.
+- Every change is written to `server/data/rooms.json` (debounced, write-then-rename). On start the server restores all rooms; players reclaim their seats with their tokens. Rooms are replayed move by move through the rules engine, so a hand-edited save can't create an illegal position.
+- **Push:** the client registers `sw.js`, subscribes through the browser's push service using the server's VAPID public key (`GET /api/push/key`), and sends the subscription with `push:subscribe`. After every move the server pushes to the player whose turn it now is. The service worker skips the notification if the game is already on screen. Tapping it opens `/?resume=CODE`, which drops straight into that game.
 - Opening the same seat in a second tab takes it over; the old tab is told so.
-- Game state lives in server memory. Restarting the server ends all games (players are returned to the lobby).
 
 ### Rules notes
 
@@ -287,7 +318,7 @@ npm test
 
 ## Ideas for next steps
 
-Move clocks · draw offers · spectators · chat · persistence (Redis) so games survive a server restart · sound effects · perpetual-chase adjudication · AI opponent for practice.
+Move clocks · draw offers · spectators · chat · sound effects · perpetual-chase adjudication · AI opponent for practice.
 
 ## Credits
 

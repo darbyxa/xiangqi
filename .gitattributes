@@ -1,0 +1,3 @@
+# Windows batch files need CRLF; shell scripts must stay LF or bash (Termux) chokes on them.
+*.bat text eol=crlf
+*.sh  text eol=lf

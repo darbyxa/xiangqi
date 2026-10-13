@@ -1,21 +1,34 @@
 /**
- * Where we remember which seat is ours.
+ * Where we remember which seats are ours.
  *
  *  - sessionStorage (per TAB, survives refresh): the seat this tab is playing. Restored automatically.
  *    Being per-tab means two tabs of one browser are two independent players — handy for local testing.
- *  - localStorage (shared): the most recent seat, offered as an opt-in "Resume game" button when a
- *    tab was closed by accident. It is never restored automatically, so it can't steal a seat from
- *    another tab.
+ *  - localStorage (shared, permanent): every game this browser has a seat in, listed in the lobby as
+ *    "Your games" so you can close the app and pick any of them up again days later. A game listed
+ *    there is only taken over when you press Resume (or tap its notification), so it can't steal a
+ *    seat from another open tab.
  */
+import type { Color, RoomView } from '../../../shared/protocol';
+
 const TAB_KEY = 'xiangqi.session.v1';
-const LAST_KEY = 'xiangqi.lastGame.v1';
+const GAMES_KEY = 'xiangqi.games.v1';
+const OLD_LAST_KEY = 'xiangqi.lastGame.v1';
 const NAME_KEY = 'xiangqi.name';
-/** matches the server's default ROOM_TTL_MINUTES */
-const RESUME_WINDOW_MS = 60 * 60_000;
+/** the server forgets an idle game after 30 days by default; keep the list tidy to match */
+const FORGET_AFTER_MS = 31 * 24 * 3600_000;
 
 export interface SavedSession {
   code: string;
   token: string;
+}
+
+/** A game in the "Your games" list, with enough detail to show it without asking the server. */
+export interface SavedGame extends SavedSession {
+  savedAt: number;
+  color?: Color;
+  opponent?: string | null;
+  myTurn?: boolean;
+  finished?: boolean;
 }
 
 const parse = (raw: string | null): SavedSession | null => {
@@ -36,33 +49,86 @@ const safe = <T>(fn: () => T, fallback: T): T => {
   }
 };
 
+// ---- this tab's seat ------------------------------------------------------------
+
 export const loadSession = (): SavedSession | null => safe(() => parse(sessionStorage.getItem(TAB_KEY)), null);
 
 export function saveSession(s: SavedSession): void {
-  safe(() => sessionStorage.setItem(TAB_KEY, JSON.stringify(s)), undefined);
-  safe(() => localStorage.setItem(LAST_KEY, JSON.stringify({ ...s, savedAt: Date.now() })), undefined);
+  safe(() => sessionStorage.setItem(TAB_KEY, JSON.stringify({ code: s.code, token: s.token })), undefined);
+  upsertGame(s.code, { token: s.token });
 }
 
-export function clearSession(): void {
-  const current = loadSession();
-  safe(() => sessionStorage.removeItem(TAB_KEY), undefined);
-  // Only forget the shared resume record if it is OUR seat (another tab may own the latest one).
-  const last = loadResumable();
-  if (current && last && last.token === current.token) clearResumable();
-}
+/** This tab stops showing its game (the game stays in "Your games"). */
+export const clearSession = (): void => safe(() => sessionStorage.removeItem(TAB_KEY), undefined);
 
-/** A recent seat from a tab that is no longer open, if any. */
-export function loadResumable(): SavedSession | null {
+// ---- every game this browser plays ---------------------------------------------
+
+function readGames(): SavedGame[] {
   return safe(() => {
-    const raw = localStorage.getItem(LAST_KEY);
-    if (!raw) return null;
-    const s = parse(raw);
-    const savedAt = (JSON.parse(raw) as { savedAt?: number }).savedAt ?? 0;
-    return s && Date.now() - savedAt < RESUME_WINDOW_MS ? s : null;
-  }, null);
+    const stored: unknown = JSON.parse(localStorage.getItem(GAMES_KEY) ?? '[]');
+    const list = (Array.isArray(stored) ? stored : []).filter(
+      (g): g is SavedGame => typeof g?.code === 'string' && typeof g.token === 'string' && typeof g.savedAt === 'number',
+    );
+    const old = parse(localStorage.getItem(OLD_LAST_KEY)); // from before the games list existed
+    if (old && !list.some((g) => g.code === old.code)) list.push({ ...old, savedAt: Date.now() });
+    return list;
+  }, []);
 }
 
-export const clearResumable = (): void => safe(() => localStorage.removeItem(LAST_KEY), undefined);
+function writeGames(list: SavedGame[]): void {
+  safe(() => {
+    localStorage.setItem(GAMES_KEY, JSON.stringify(list));
+    localStorage.removeItem(OLD_LAST_KEY);
+  }, undefined);
+}
+
+/** Most recently played first; long-idle games are dropped. */
+export function listGames(): SavedGame[] {
+  const cutoff = Date.now() - FORGET_AFTER_MS;
+  return readGames()
+    .filter((g) => g.savedAt > cutoff)
+    .sort((a, b) => b.savedAt - a.savedAt);
+}
+
+export const findGame = (code: string): SavedGame | undefined => readGames().find((g) => g.code === code);
+
+function upsertGame(code: string, patch: Partial<SavedGame>): void {
+  const list = readGames();
+  const i = list.findIndex((g) => g.code === code);
+  if (i >= 0) list[i] = { ...list[i], ...patch, savedAt: Date.now() };
+  else if (patch.token) list.push({ code, token: patch.token, ...patch, savedAt: Date.now() });
+  writeGames(list);
+}
+
+/** Keep the lobby's summary of a game up to date with what the server last told us. */
+export function rememberView(view: RoomView): void {
+  const saved = findGame(view.code);
+  const summary = {
+    color: view.you,
+    opponent: view.players[view.you === 'red' ? 'black' : 'red']?.name ?? null,
+    myTurn: view.status === 'playing' && view.turn === view.you,
+    finished: view.status === 'finished',
+  };
+  if (saved && Object.entries(summary).every(([k, v]) => saved[k as keyof SavedGame] === v)) return;
+  upsertGame(view.code, summary);
+}
+
+export const forgetGame = (code: string): void => writeGames(readGames().filter((g) => g.code !== code));
+
+/**
+ * Opened from a notification (/?resume=CODE)? Make that game this tab's game, so the restore on
+ * connect drops straight into it. Removes the parameter from the address bar either way.
+ */
+export function adoptResumeLink(): void {
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get('resume');
+  if (!code) return;
+  const game = findGame(code.toUpperCase());
+  if (game) safe(() => sessionStorage.setItem(TAB_KEY, JSON.stringify({ code: game.code, token: game.token })), undefined);
+  params.delete('resume');
+  const rest = params.toString();
+  window.history.replaceState(null, '', window.location.pathname + (rest ? `?${rest}` : ''));
+}
 
 export const loadName = (): string => safe(() => localStorage.getItem(NAME_KEY) ?? '', '');
 export const saveName = (name: string): void => safe(() => localStorage.setItem(NAME_KEY, name), undefined);

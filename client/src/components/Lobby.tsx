@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import type { Connection } from '../hooks/useGameSession';
-import { loadName, saveName, type SavedSession } from '../lib/session';
+import { colorName } from '../lib/pieces';
+import { loadName, saveName, type SavedGame } from '../lib/session';
 import { PieceIcon } from './PieceIcon';
 
 interface Props {
@@ -9,19 +10,26 @@ interface Props {
   serverUrl: string;
   onCreate: (name: string) => Promise<string | null>;
   onJoin: (code: string, name: string) => Promise<string | null>;
-  resumable: SavedSession | null;
-  onResume: () => Promise<string | null>;
-  onDismissResume: () => void;
+  games: SavedGame[];
+  onResume: (code: string) => Promise<string | null>;
+  onForget: (code: string) => void;
+}
+
+function gameSummary(g: SavedGame): string {
+  if (g.finished) return 'Finished';
+  if (g.opponent === null) return 'Waiting for an opponent to join';
+  if (g.myTurn === undefined) return 'In progress';
+  return g.myTurn ? 'Your move' : `Waiting for ${g.opponent ?? 'your opponent'}`;
 }
 
 const CODE_CHARS = /[^A-HJ-NP-Z2-9]/g;
 
-export function Lobby({ connection, connectError, serverUrl, onCreate, onJoin, resumable, onResume, onDismissResume }: Props) {
+export function Lobby({ connection, connectError, serverUrl, onCreate, onJoin, games, onResume, onForget }: Props) {
   const invited = new URLSearchParams(window.location.search).get('room') ?? '';
   const [name, setName] = useState(loadName);
   const [code, setCode] = useState(() => invited.toUpperCase().replace(CODE_CHARS, '').slice(0, 6));
-  const [busy, setBusy] = useState<'create' | 'join' | null>(null);
-  const [error, setError] = useState<{ where: 'create' | 'join'; text: string } | null>(null);
+  const [busy, setBusy] = useState<'create' | 'join' | 'resume' | null>(null);
+  const [error, setError] = useState<{ where: 'create' | 'join' | 'resume'; text: string } | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -57,28 +65,43 @@ export function Lobby({ connection, connectError, serverUrl, onCreate, onJoin, r
       </section>
 
       <div className="lobby-forms">
-        {resumable && (
+        {games.length > 0 && (
           <div className="panel resume">
-            <h2>Game in progress</h2>
-            <p>
-              You were playing in room <strong>{resumable.code}</strong>. Pick up where you left off?
-            </p>
-            <div className="row">
-              <button
-                type="button"
-                className="btn primary"
-                disabled={!online || busy !== null}
-                onClick={async () => {
-                  setBusy('join');
-                  const err = await onResume();
-                  setBusy(null);
-                  if (err) setError({ where: 'join', text: err });
-                }}
-              >
-                Resume game
-              </button>
-              <button type="button" className="btn ghost" onClick={onDismissResume}>Not now</button>
-            </div>
+            <h2>Your games</h2>
+            <ul className="saved-games">
+              {games.map((g) => (
+                <li key={g.code} className={g.myTurn && !g.finished ? 'my-turn' : ''}>
+                  <div className="saved-game-info">
+                    <strong className="code">{g.code}</strong>
+                    <span>
+                      {g.opponent ? `vs ${g.opponent}` : ''}
+                      {g.color ? `${g.opponent ? ' · ' : ''}you are ${colorName(g.color)}` : ''}
+                    </span>
+                    <span className="saved-game-status">{gameSummary(g)}</span>
+                  </div>
+                  <div className="row">
+                    <button
+                      type="button"
+                      className={`btn small ${g.myTurn && !g.finished ? 'primary' : ''}`}
+                      disabled={!online || busy !== null}
+                      onClick={async () => {
+                        setBusy('resume');
+                        setError(null);
+                        const err = await onResume(g.code);
+                        setBusy(null);
+                        if (err) setError({ where: 'resume', text: err });
+                      }}
+                    >
+                      {g.finished ? 'Open' : 'Resume'}
+                    </button>
+                    {g.finished && (
+                      <button type="button" className="btn ghost small" onClick={() => onForget(g.code)}>Remove</button>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+            {error?.where === 'resume' && <p className="form-error" role="alert">{error.text}</p>}
           </div>
         )}
 

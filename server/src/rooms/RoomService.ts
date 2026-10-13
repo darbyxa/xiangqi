@@ -6,6 +6,11 @@
  *   - A player's SEAT is identified by a secret `token` handed out when they create/join.
  *   - The token lives in the browser's localStorage, so a page refresh or a dropped connection
  *     can reclaim the same seat via `rejoin` — the socket id changes, the seat does not.
+ *
+ * Persistence
+ *   - `snapshot()` / `restore()` turn every room into plain JSON (no sockets, no timers), and
+ *     `onChange` fires after every state change so the caller can save it. Games therefore
+ *     survive a server restart and can be continued days later.
  */
 import { randomUUID } from 'node:crypto';
 import type {
@@ -14,16 +19,20 @@ import type {
   GameStatus,
   JoinData,
   Notice,
+  PushMessage,
+  PushSubscriptionData,
   RoomView,
 } from '../../../shared/protocol';
 import { opposite } from '../game/engine';
-import { XiangqiGame } from '../game/XiangqiGame';
+import { XiangqiGame, type SavedGame } from '../game/XiangqiGame';
 import { generateRoomCode, normalizeRoomCode } from '../utils/roomCode';
 
 export interface Notifier {
   update(socketId: string, view: RoomView): void;
   notice(socketId: string, notice: Notice): void;
   replaced(socketId: string): void;
+  /** deliver a Web Push notification to a seat's devices (optional: tests and push-less setups omit it) */
+  push?(subscriptions: PushSubscriptionData[], message: PushMessage): void;
 }
 
 export interface RoomServiceConfig {
@@ -39,6 +48,8 @@ interface Seat {
   socketId: string | null;
   disconnectedAt: number | null;
   wins: number;
+  /** devices to notify when it's this seat's move */
+  push: PushSubscriptionData[];
 }
 
 interface Room {
@@ -55,6 +66,20 @@ interface Room {
 type Failure = Extract<Ack, { ok: false }>;
 const fail = (error: Failure['error'], message: string): Failure => ({ ok: false, error, message });
 const OK: Ack = { ok: true };
+/** one player rarely has more devices than this; the oldest subscription is dropped beyond it */
+const MAX_PUSH_PER_SEAT = 5;
+
+export interface RoomsSnapshot {
+  version: 1;
+  rooms: {
+    code: string;
+    seats: Record<Color, { token: string; name: string; wins: number; push: PushSubscriptionData[] } | null>;
+    game: SavedGame;
+    settled: boolean;
+    restartRequestedBy: Color | null;
+    lastActivity: number;
+  }[];
+}
 
 const cleanName = (raw: unknown): string => {
   if (typeof raw !== 'string') return 'Guest';
@@ -66,6 +91,8 @@ const cleanName = (raw: unknown): string => {
 export class RoomService {
   private rooms = new Map<string, Room>();
   private bySocket = new Map<string, { code: string; color: Color }>();
+  /** called after anything worth saving changes */
+  onChange: (() => void) | null = null;
 
   constructor(
     private cfg: RoomServiceConfig,
@@ -131,6 +158,12 @@ export class RoomService {
         message: `${seat.name} joined the game.`,
       });
     }
+    if (opponent) {
+      this.pushTo(room, opponent, {
+        title: `${seat.name} joined your game`,
+        body: opponent.color === 'red' ? 'You are Red — your move.' : `You are Black — ${seat.name} moves first.`,
+      });
+    }
     this.broadcast(room);
     return { ok: true, code, token: seat.token, color: freeColor };
   }
@@ -145,7 +178,8 @@ export class RoomService {
     if (!seat) return fail('SESSION_INVALID', 'Your seat in that game is no longer available.');
 
     const current = this.bySocket.get(socketId);
-    if (current && (current.code !== code || current.color !== seat.color)) this.leave(socketId);
+    // Switching to another of your games parks this one (it is NOT resigned).
+    if (current && (current.code !== code || current.color !== seat.color)) this.handleDisconnect(socketId);
 
     const wasAway = seat.socketId === null;
     if (seat.socketId && seat.socketId !== socketId) {
@@ -208,6 +242,12 @@ export class RoomService {
 
   // ------------------------------------------------------------- connection
 
+  /** Step away from the game without resigning: the seat is kept and can be reclaimed with `rejoin`. */
+  park(socketId: string): Ack {
+    this.handleDisconnect(socketId);
+    return OK;
+  }
+
   handleDisconnect(socketId: string): void {
     const entry = this.bySocket.get(socketId);
     if (!entry) return;
@@ -231,7 +271,10 @@ export class RoomService {
     if (opponent?.socketId) {
       this.notify.notice(opponent.socketId, {
         kind: 'opponent_disconnected',
-        message: `${seat.name} lost connection. They have ${Math.round(this.cfg.reconnectGraceMs / 1000)}s to return.`,
+        message:
+          this.cfg.reconnectGraceMs > 0 && this.statusOf(room) === 'playing'
+            ? `${seat.name} lost connection. They have ${Math.round(this.cfg.reconnectGraceMs / 1000)}s to return.`
+            : `${seat.name} has gone offline. You can still move — they'll be notified.`,
       });
     }
     this.broadcast(room);
@@ -266,6 +309,23 @@ export class RoomService {
     room.restartRequestedBy = null; // playing on lapses any pending restart request
     room.lastActivity = this.now();
     this.settle(room);
+    const mover = room.seats[color]!;
+    const waiting = room.seats[opposite(color)];
+    if (waiting) {
+      const { notation, check } = outcome.record;
+      const result = room.game.result;
+      const ending = !result
+        ? ''
+        : result.winner === null
+          ? ' The game is a draw.'
+          : result.winner === waiting.color
+            ? ' You win!'
+            : ` ${mover.name} wins.`;
+      this.pushTo(room, waiting, {
+        title: result ? 'Game over' : check ? 'Check! Your move' : 'Your move',
+        body: `${mover.name} played ${notation}.${ending}`,
+      });
+    }
     this.broadcast(room);
     return OK;
   }
@@ -278,6 +338,8 @@ export class RoomService {
     room.game.resign(color);
     room.lastActivity = this.now();
     this.settle(room);
+    const opponent = room.seats[opposite(color)];
+    if (opponent) this.pushTo(room, opponent, { title: 'Game over', body: `${room.seats[color]!.name} resigned — you win!` });
     this.broadcast(room);
     return OK;
   }
@@ -349,6 +411,99 @@ export class RoomService {
     this.broadcast(room);
   }
 
+  // ------------------------------------------------------------------ push
+
+  subscribePush(socketId: string, raw: unknown): Ack {
+    const ctx = this.contextFor(socketId);
+    if (!ctx.ok) return ctx;
+    const sub = cleanSubscription(raw);
+    if (!sub) return fail('INVALID_PAYLOAD', 'This browser\'s push service is not supported.');
+    const seat = ctx.room.seats[ctx.color]!;
+    seat.push = [...seat.push.filter((s) => s.endpoint !== sub.endpoint), sub].slice(-MAX_PUSH_PER_SEAT);
+    this.changed();
+    return OK;
+  }
+
+  unsubscribePush(socketId: string, endpoint: unknown): Ack {
+    const ctx = this.contextFor(socketId);
+    if (!ctx.ok) return ctx;
+    const seat = ctx.room.seats[ctx.color]!;
+    seat.push = seat.push.filter((s) => s.endpoint !== endpoint);
+    this.changed();
+    return OK;
+  }
+
+  /** The push service says this subscription is gone (permission revoked, browser data cleared): forget it. */
+  dropPushEndpoint(endpoint: string): void {
+    for (const room of this.rooms.values()) {
+      for (const seat of [room.seats.red, room.seats.black]) {
+        if (seat) seat.push = seat.push.filter((s) => s.endpoint !== endpoint);
+      }
+    }
+    this.changed();
+  }
+
+  private pushTo(room: Room, seat: Seat, msg: Pick<PushMessage, 'title' | 'body'>): void {
+    if (!seat.push.length || !this.notify.push) return;
+    // Always sent: the service worker drops it if the game is already on screen.
+    this.notify.push(seat.push, { ...msg, tag: `xiangqi-${room.code}`, url: `/?resume=${room.code}` });
+  }
+
+  // ----------------------------------------------------------- persistence
+
+  snapshot(): RoomsSnapshot {
+    const seat = (s: Seat | null) => s && { token: s.token, name: s.name, wins: s.wins, push: s.push };
+    return {
+      version: 1,
+      rooms: [...this.rooms.values()].map((room) => ({
+        code: room.code,
+        seats: { red: seat(room.seats.red), black: seat(room.seats.black) },
+        game: room.game.toJSON(),
+        settled: room.settled,
+        restartRequestedBy: room.restartRequestedBy,
+        lastActivity: room.lastActivity,
+      })),
+    };
+  }
+
+  /** Load saved rooms. Everyone starts offline and reclaims their seat with `rejoin`. Returns how many loaded. */
+  restore(snapshot: RoomsSnapshot): number {
+    if (snapshot?.version !== 1 || !Array.isArray(snapshot.rooms)) return 0;
+    let loaded = 0;
+    for (const saved of snapshot.rooms) {
+      try {
+        const room: Room = {
+          code: saved.code,
+          seats: { red: null, black: null },
+          game: XiangqiGame.fromJSON(saved.game),
+          settled: saved.settled,
+          restartRequestedBy: saved.restartRequestedBy,
+          lastActivity: saved.lastActivity,
+          forfeitTimers: {},
+        };
+        for (const color of ['red', 'black'] as const) {
+          const s = saved.seats[color];
+          if (!s) continue;
+          room.seats[color] = {
+            color,
+            token: s.token,
+            name: cleanName(s.name),
+            wins: s.wins,
+            push: (s.push ?? []).map(cleanSubscription).filter((p) => p !== null),
+            socketId: null,
+            disconnectedAt: null, // no forfeit countdown: nobody chose to leave, the server restarted
+          };
+        }
+        if (!room.seats.red && !room.seats.black) continue;
+        this.rooms.set(room.code, room);
+        loaded++;
+      } catch (err) {
+        console.error(`[rooms] skipped saved room ${saved?.code}:`, err);
+      }
+    }
+    return loaded;
+  }
+
   // ---------------------------------------------------------------- upkeep
 
   /** Delete rooms that nobody has been connected to for a while. Call on an interval. */
@@ -378,7 +533,7 @@ export class RoomService {
   // --------------------------------------------------------------- helpers
 
   private newSeat(color: Color, socketId: string, rawName: unknown): Seat {
-    return { color, token: randomUUID(), name: cleanName(rawName), socketId, disconnectedAt: null, wins: 0 };
+    return { color, token: randomUUID(), name: cleanName(rawName), socketId, disconnectedAt: null, wins: 0, push: [] };
   }
 
   private contextFor(socketId: string): { ok: true; room: Room; color: Color } | Failure {
@@ -423,6 +578,11 @@ export class RoomService {
       if (seat?.socketId) this.bySocket.delete(seat.socketId);
     }
     this.rooms.delete(room.code);
+    this.changed();
+  }
+
+  private changed(): void {
+    this.onChange?.();
   }
 
   /** The view a particular seat is allowed to see (includes only THEIR legal moves). */
@@ -465,7 +625,28 @@ export class RoomService {
       const seat = room.seats[color];
       if (seat?.socketId) this.notify.update(seat.socketId, this.viewFor(room, color));
     }
+    this.changed();
   }
+}
+
+/** Web Push services used by Chrome/Android, Firefox, Edge and Safari. Anything else is refused, so a
+ *  client can't make the server send requests to an arbitrary address. */
+const PUSH_HOSTS = [/^fcm\.googleapis\.com$/, /(^|\.)push\.services\.mozilla\.com$/, /\.notify\.windows\.com$/, /(^|\.)push\.apple\.com$/];
+
+function cleanSubscription(raw: unknown): PushSubscriptionData | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const { endpoint, keys } = raw as { endpoint?: unknown; keys?: { p256dh?: unknown; auth?: unknown } };
+  if (typeof endpoint !== 'string' || endpoint.length > 1000) return null;
+  if (typeof keys?.p256dh !== 'string' || typeof keys.auth !== 'string') return null;
+  if (keys.p256dh.length > 200 || keys.auth.length > 100) return null;
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== 'https:' || !PUSH_HOSTS.some((h) => h.test(url.hostname))) return null;
+  return { endpoint, keys: { p256dh: keys.p256dh, auth: keys.auth } };
 }
 
 const isSquare = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < 90;

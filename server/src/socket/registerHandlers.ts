@@ -9,11 +9,12 @@ import type { Notifier, RoomService } from '../rooms/RoomService';
 export type GameServer = Server<ClientToServerEvents, ServerToClientEvents>;
 
 /** Bridges RoomService → Socket.IO (server → client pushes). */
-export function makeNotifier(io: GameServer): Notifier {
+export function makeNotifier(io: GameServer, push?: Notifier['push']): Notifier {
   return {
     update: (socketId, view) => void io.to(socketId).emit('room:update', view),
     notice: (socketId, notice) => void io.to(socketId).emit('room:notice', notice),
     replaced: (socketId) => void io.to(socketId).emit('room:replaced'),
+    push,
   };
 }
 
@@ -48,10 +49,13 @@ export function registerHandlers(io: GameServer, service: RoomService): void {
     socket.on('room:join', handle((p) => service.joinRoom(socket.id, obj(p).code, obj(p).name)) as never);
     socket.on('room:rejoin', handle((p) => service.rejoin(socket.id, obj(p).code, obj(p).token)) as never);
     socket.on('room:leave', handle(() => service.leave(socket.id)) as never);
+    socket.on('room:park', handle(() => service.park(socket.id)) as never);
     socket.on('game:move', handle((p) => service.move(socket.id, obj(p).from, obj(p).to)) as never);
     socket.on('game:resign', handle(() => service.resign(socket.id)) as never);
     socket.on('game:restart:request', handle(() => service.requestRestart(socket.id)) as never);
     socket.on('game:restart:respond', handle((p) => service.respondRestart(socket.id, obj(p).accept)) as never);
+    socket.on('push:subscribe', handle((p) => service.subscribePush(socket.id, obj(p).subscription)) as never);
+    socket.on('push:unsubscribe', handle((p) => service.unsubscribePush(socket.id, obj(p).endpoint)) as never);
 
     socket.on('disconnect', () => service.handleDisconnect(socket.id));
   });
