@@ -4,8 +4,13 @@
   "private": true,
   "description": "Real-time multiplayer Xiangqi (Chinese Chess) — React + TypeScript client, Express + Socket.IO server",
   "type": "module",
-  "workspaces": ["server", "client"],
-  "engines": { "node": ">=22.12.0" },
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "dev": "concurrently -k -n server,client -c \"#c9a24b,#e07a7a\" \"npm:dev:server\" \"npm:dev:client\"",
     "dev:server": "npm run dev -w server",
@@ -17,5 +22,8 @@
   },
   "devDependencies": {
     "concurrently": "^10.0.5"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
   }
 }
