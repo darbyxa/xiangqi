@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import type { RoomView } from '../../../shared/protocol';
 import type { Connection } from '../hooks/useGameSession';
 import { copyText } from '../lib/clipboard';
+import type { PushState } from '../lib/push';
 import { colorName, other } from '../lib/pieces';
 import { statusLine } from '../lib/result';
 import { Board } from './Board';
@@ -20,10 +21,40 @@ interface Props {
   onRestart: () => void;
   onRespond: (accept: boolean) => void;
   onLeave: () => void;
+  /** back to the lobby without resigning */
+  onPark: () => void;
+  notifications: PushState;
+  onToggleNotifications: () => void;
   notify: (text: string) => void;
 }
 
-export function GameScreen({ view, receivedAt, connection, onMove, onResign, onRestart, onRespond, onLeave, notify }: Props) {
+const NOTIFY_LABEL: Record<PushState, string> = {
+  on: '🔔 Notifications on',
+  off: "🔕 Notify me when it's my move",
+  denied: '🔕 Notifications blocked',
+  unsupported: '🔕 Notifications unavailable',
+};
+const NOTIFY_HINT: Record<PushState, string> = {
+  on: 'This device gets a notification when your opponent moves. Tap to turn off.',
+  off: 'Get a notification on this device when your opponent moves, even if the game is closed.',
+  denied: "Notifications are blocked for this site — allow them in the browser's site settings.",
+  unsupported: 'Notifications need the https (ngrok) address and a recent browser.',
+};
+
+export function GameScreen({
+  view,
+  receivedAt,
+  connection,
+  onMove,
+  onResign,
+  onRestart,
+  onRespond,
+  onLeave,
+  onPark,
+  notifications,
+  onToggleNotifications,
+  notify,
+}: Props) {
   const me = view.you;
   const opp = other(me);
   const [confirm, setConfirm] = useState<'resign' | 'leave' | null>(null);
@@ -66,13 +97,18 @@ export function GameScreen({ view, receivedAt, connection, onMove, onResign, onR
           <button type="button" className="btn tiny" onClick={() => void copy('Room code', view.code)}>Copy code</button>
           <button type="button" className="btn tiny" onClick={() => void copy('Invite link', inviteLink)}>Copy link</button>
         </div>
-        <button
-          type="button"
-          className="btn ghost small"
-          onClick={() => (view.status === 'playing' ? setConfirm('leave') : onLeave())}
-        >
-          Leave room
-        </button>
+        <div className="topbar-actions">
+          <button type="button" className="btn ghost small" onClick={onPark} title="Back to the lobby — this game is kept and can be resumed any time">
+            My games
+          </button>
+          <button
+            type="button"
+            className="btn ghost small"
+            onClick={() => (view.status === 'playing' ? setConfirm('leave') : onLeave())}
+          >
+            Leave room
+          </button>
+        </div>
       </header>
 
       {offline && (
@@ -119,6 +155,10 @@ export function GameScreen({ view, receivedAt, connection, onMove, onResign, onR
                     <button type="button" className="btn ghost" onClick={() => void copy('Invite link', inviteLink)}>Copy invite link</button>
                   </div>
                   <p className="hint">You are {colorName(me)}{me === 'red' ? ' and move first' : ''}.</p>
+                  <p className="hint">
+                    You can close this page — the game is saved
+                    {notifications === 'on' ? " and you'll get a notification when they join." : '. Turn on notifications to hear when they join.'}
+                  </p>
                 </div>
               </div>
             )}
@@ -183,6 +223,19 @@ export function GameScreen({ view, receivedAt, connection, onMove, onResign, onR
             )}
             {view.status === 'waiting' && <p className="muted">Resign and restart become available once your opponent joins.</p>}
           </section>
+
+          <section className="panel notify-panel">
+            <button
+              type="button"
+              className={`btn wide ${notifications === 'off' ? 'primary' : 'ghost'}`}
+              onClick={onToggleNotifications}
+              disabled={notifications === 'unsupported'}
+              aria-pressed={notifications === 'on'}
+            >
+              {NOTIFY_LABEL[notifications]}
+            </button>
+            <p className="muted">{NOTIFY_HINT[notifications]}</p>
+          </section>
         </aside>
       </main>
 
@@ -202,7 +255,7 @@ export function GameScreen({ view, receivedAt, connection, onMove, onResign, onR
       {confirm === 'leave' && (
         <ConfirmDialog
           title="Leave the room?"
-          body="Leaving a game in progress counts as a resignation, and you won't be able to rejoin this seat."
+          body="Leaving a game in progress counts as a resignation, and you won't be able to rejoin this seat. To take a break instead, use “My games” — the game stays saved."
           confirmLabel="Leave and resign"
           danger
           onCancel={() => setConfirm(null)}

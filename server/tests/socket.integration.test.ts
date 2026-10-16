@@ -42,7 +42,7 @@ const nextView = (s: Client, pred: (v: RoomView) => boolean = () => true) =>
   });
 
 beforeAll(async () => {
-  server = createGameServer({ ...loadConfig({}), port: 0, serveClient: false, randomColors: false, reconnectGraceMs: 5000 });
+  server = createGameServer({ ...loadConfig({}), port: 0, serveClient: false, randomColors: false, reconnectGraceMs: 5000, dataDir: null });
   await new Promise<void>((r) => server.httpServer.listen(0, '127.0.0.1', r));
   url = `http://127.0.0.1:${(server.httpServer.address() as AddressInfo).port}`;
 });

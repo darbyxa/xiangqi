@@ -1,7 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Ack, JoinData, Notice, RoomView } from '../../../shared/protocol';
+import { currentSubscription, disablePush, enablePush, pushState, type PushState } from '../lib/push';
 import { SERVER_URL, socket } from '../lib/socket';
-import { clearResumable, clearSession, loadResumable, loadSession, saveSession, type SavedSession } from '../lib/session';
+import {
+  clearSession,
+  findGame,
+  forgetGame,
+  listGames,
+  loadSession,
+  rememberView,
+  saveSession,
+  type SavedGame,
+  type SavedSession,
+} from '../lib/session';
 
 export type Connection = 'connecting' | 'online' | 'offline';
 
@@ -22,6 +33,12 @@ async function call<T extends Ack<any>>(fn: () => Promise<T>): Promise<T | Extra
   }
 }
 
+/** Give the server this device's push subscription for the seat we just took (no prompt; no-op if none). */
+async function syncPush(): Promise<void> {
+  const subscription = await currentSubscription();
+  if (subscription) await call(() => socket.timeout(8000).emitWithAck('push:subscribe', { subscription }));
+}
+
 /**
  * Owns the Socket.IO connection and everything derived from it.
  * The server is authoritative: `room` is simply the last validated state it pushed to us.
@@ -32,8 +49,9 @@ export function useGameSession() {
   const [connectError, setConnectError] = useState<string | null>(null);
   const [restoring, setRestoring] = useState<boolean>(() => loadSession() !== null);
   const [toasts, setToasts] = useState<Toast[]>([]);
-  // A seat from a tab that was closed — offered in the lobby, never taken automatically.
-  const [resumable, setResumable] = useState<SavedSession | null>(() => (loadSession() ? null : loadResumable()));
+  // Every game this browser has a seat in — listed in the lobby, never taken over automatically.
+  const [games, setGames] = useState<SavedGame[]>(listGames);
+  const [notifications, setNotifications] = useState<PushState>('unsupported');
   const roomRef = useRef(room);
   roomRef.current = room;
 
@@ -43,6 +61,11 @@ export function useGameSession() {
     window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 5000);
   }, []);
   const dismissToast = useCallback((id: number) => setToasts((t) => t.filter((x) => x.id !== id)), []);
+  const refreshGames = useCallback(() => setGames(listGames()), []);
+
+  useEffect(() => {
+    void pushState().then(setNotifications);
+  }, []);
 
   useEffect(() => {
     const restore = async () => {
@@ -52,9 +75,13 @@ export function useGameSession() {
         return;
       }
       const res = await call(() => socket.timeout(8000).emitWithAck('room:rejoin', saved));
-      if (!res.ok) {
-        // Server restarted, room expired, or seat taken: forget it and show the lobby.
+      if (res.ok) {
+        void syncPush();
+      } else if (res.error === 'ROOM_NOT_FOUND' || res.error === 'SESSION_INVALID') {
+        // The game was deleted or the seat given away: forget it and show the lobby.
         clearSession();
+        forgetGame(saved.code);
+        refreshGames();
         setRoom(null);
         toast(res.message || 'Your previous game is no longer available.', 'error');
       }
@@ -72,11 +99,15 @@ export function useGameSession() {
       setConnectError(err.message);
       setRestoring(false);
     };
-    const onUpdate = (view: RoomView) => setRoom({ view, receivedAt: Date.now() });
+    const onUpdate = (view: RoomView) => {
+      setRoom({ view, receivedAt: Date.now() });
+      rememberView(view);
+    };
     const onNotice = (n: Notice) => toast(n.message);
     const onReplaced = () => {
       clearSession();
       setRoom(null);
+      refreshGames();
       toast('This game was opened in another tab or window, which has taken over your seat.', 'error');
     };
 
@@ -97,50 +128,112 @@ export function useGameSession() {
       socket.off('room:notice', onNotice);
       socket.off('room:replaced', onReplaced);
     };
-  }, [toast]);
+  }, [toast, refreshGames]);
 
   // ---- lobby -------------------------------------------------------------
 
-  const createRoom = useCallback(async (name: string): Promise<string | null> => {
-    const res = await call(() => socket.timeout(8000).emitWithAck('room:create', { name }));
-    if (!res.ok) return res.message;
-    const data = res as { ok: true } & JoinData;
+  const seated = useCallback((data: SavedSession) => {
     saveSession({ code: data.code, token: data.token });
-    return null;
+    void syncPush();
   }, []);
 
-  const joinRoom = useCallback(async (code: string, name: string): Promise<string | null> => {
-    const res = await call(() => socket.timeout(8000).emitWithAck('room:join', { code, name }));
-    if (!res.ok) return res.message;
-    const data = res as { ok: true } & JoinData;
-    saveSession({ code: data.code, token: data.token });
-    return null;
-  }, []);
+  const createRoom = useCallback(
+    async (name: string): Promise<string | null> => {
+      const res = await call(() => socket.timeout(8000).emitWithAck('room:create', { name }));
+      if (!res.ok) return res.message;
+      seated(res as { ok: true } & JoinData);
+      return null;
+    },
+    [seated],
+  );
 
+  const joinRoom = useCallback(
+    async (code: string, name: string): Promise<string | null> => {
+      const res = await call(() => socket.timeout(8000).emitWithAck('room:join', { code, name }));
+      if (!res.ok) return res.message;
+      seated(res as { ok: true } & JoinData);
+      return null;
+    },
+    [seated],
+  );
+
+  /** Leave for good (resigns a game in progress) and drop it from "Your games". */
   const leaveRoom = useCallback(async () => {
+    const code = roomRef.current?.view.code;
+    clearSession();
+    if (code) forgetGame(code);
+    setRoom(null);
+    refreshGames();
+    await call(() => socket.timeout(5000).emitWithAck('room:leave'));
+  }, [refreshGames]);
+
+  /** Back to the lobby, keeping the seat: the game stays in "Your games" and can be resumed any time. */
+  const parkRoom = useCallback(async () => {
     clearSession();
     setRoom(null);
-    await call(() => socket.timeout(5000).emitWithAck('room:leave'));
-  }, []);
+    refreshGames();
+    await call(() => socket.timeout(5000).emitWithAck('room:park'));
+  }, [refreshGames]);
 
-  const resumeGame = useCallback(async (): Promise<string | null> => {
-    const saved = resumable;
-    if (!saved) return null;
-    const res = await call(() => socket.timeout(8000).emitWithAck('room:rejoin', saved));
-    if (!res.ok) {
-      clearResumable();
-      setResumable(null);
-      return res.message;
+  const resumeGame = useCallback(
+    async (code: string): Promise<string | null> => {
+      if (roomRef.current?.view.code === code) return null;
+      const saved = findGame(code);
+      if (!saved) return 'That game is no longer saved on this device.';
+      const res = await call(() => socket.timeout(8000).emitWithAck('room:rejoin', saved));
+      if (!res.ok) {
+        if (res.error === 'ROOM_NOT_FOUND' || res.error === 'SESSION_INVALID') {
+          forgetGame(code);
+          refreshGames();
+        }
+        return res.message;
+      }
+      seated(saved);
+      return null;
+    },
+    [refreshGames, seated],
+  );
+
+  const forget = useCallback(
+    (code: string) => {
+      forgetGame(code);
+      refreshGames();
+    },
+    [refreshGames],
+  );
+
+  // A tapped notification while the app is already open: switch to that game.
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return;
+    const onMessage = (e: MessageEvent) => {
+      const data = e.data as { type?: string; code?: string } | null;
+      if (data?.type !== 'resume' || typeof data.code !== 'string') return;
+      void resumeGame(data.code).then((err) => err && toast(err, 'error'));
+    };
+    navigator.serviceWorker.addEventListener('message', onMessage);
+    return () => navigator.serviceWorker.removeEventListener('message', onMessage);
+  }, [resumeGame, toast]);
+
+  // ---- notifications -----------------------------------------------------------
+
+  const toggleNotifications = useCallback(async () => {
+    if (notifications === 'on') {
+      const endpoint = await disablePush();
+      if (endpoint) await call(() => socket.timeout(8000).emitWithAck('push:unsubscribe', { endpoint }));
+      setNotifications(await pushState());
+      toast('Notifications turned off on this device.');
+      return;
     }
-    saveSession(saved);
-    setResumable(null);
-    return null;
-  }, [resumable]);
-
-  const dismissResumable = useCallback(() => {
-    clearResumable();
-    setResumable(null);
-  }, []);
+    const res = await enablePush();
+    if (!res.ok) {
+      setNotifications(await pushState());
+      toast(res.message, 'error');
+      return;
+    }
+    const ack = await call(() => socket.timeout(8000).emitWithAck('push:subscribe', { subscription: res.subscription }));
+    setNotifications('on');
+    toast(ack.ok ? "Notifications on — you'll be told when it's your move." : ack.message, ack.ok ? 'info' : 'error');
+  }, [notifications, toast]);
 
   // ---- game actions (all just *requests*; the server decides) ------------------
 
@@ -181,15 +274,18 @@ export function useGameSession() {
     connectError,
     serverUrl: SERVER_URL || window.location.origin,
     restoring,
-    resumable,
+    games,
     resumeGame,
-    dismissResumable,
+    forgetGame: forget,
+    notifications,
+    toggleNotifications,
     toasts,
     dismissToast,
     notify: toast,
     createRoom,
     joinRoom,
     leaveRoom,
+    parkRoom,
     move,
     resign,
     requestRestart,

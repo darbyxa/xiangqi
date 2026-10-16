@@ -21,7 +21,8 @@
     "typecheck": "npm run typecheck -w server && npm run typecheck -w client"
   },
   "devDependencies": {
-    "concurrently": "^10.0.5"
+    "concurrently": "^10.0.5",
+    "qrcode-terminal": "^0.12.0"
   },
   "allowScripts": {
     "esbuild@0.28.2": true

@@ -24,6 +24,12 @@ export interface Config {
   roomTtlMs: number;
   /** pick the host's colour at random (otherwise the host is always Red) */
   randomColors: boolean;
+  /** where games and push keys are saved; null = keep everything in memory only */
+  dataDir: string | null;
+  /** send Web Push notifications ("your move") — needs dataDir for its keys */
+  push: boolean;
+  /** contact address the push services see for this server (mailto: or https:) */
+  vapidSubject: string;
 }
 
 const bool = (v: string | undefined, fallback: boolean) =>
@@ -54,9 +60,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     clientOrigins: origins.length ? origins : DEFAULT_ORIGINS,
     serveClient: bool(env.SERVE_CLIENT, true),
     clientDistDir: path.resolve(serverDir, env.CLIENT_DIST_DIR || '../client/dist'),
-    reconnectGraceMs: Math.round(num(env.RECONNECT_GRACE_SECONDS, 90) * 1000),
-    roomTtlMs: Math.round(num(env.ROOM_TTL_MINUTES, 60) * 60_000),
+    // Defaults suit correspondence play: a player who closes the app never forfeits, and an
+    // unfinished game is kept for 30 days since the last move.
+    reconnectGraceMs: Math.round(num(env.RECONNECT_GRACE_SECONDS, 0) * 1000),
+    roomTtlMs: Math.round(num(env.ROOM_TTL_MINUTES, 30 * 24 * 60) * 60_000),
     randomColors: bool(env.RANDOM_COLORS, true),
+    dataDir: bool(env.SAVE_GAMES, true) ? path.resolve(serverDir, env.DATA_DIR || 'data') : null,
+    push: bool(env.PUSH_NOTIFICATIONS, true),
+    vapidSubject: env.VAPID_SUBJECT?.trim() || 'mailto:xiangqi@example.com',
   };
 }
 

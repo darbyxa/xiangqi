@@ -5,12 +5,16 @@ import { defineConfig, loadEnv } from 'vite';
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
 
-  // In dev, the browser talks to the Vite server and Vite forwards /socket.io to the game server.
+  // In dev, the browser talks to the Vite server and Vite forwards /socket.io (and /api) to the game server.
   // That keeps everything on ONE origin, so `ngrok http 5173` also works, and there are no CORS surprises.
   const proxy = {
     '/socket.io': {
       target: env.DEV_PROXY_TARGET || 'http://localhost:3001',
       ws: true,
+      changeOrigin: true,
+    },
+    '/api': {
+      target: env.DEV_PROXY_TARGET || 'http://localhost:3001',
       changeOrigin: true,
     },
   };

@@ -31,6 +31,11 @@ export type MoveOutcome =
   | { ok: true; record: MoveRecord }
   | { ok: false; error: ErrorCode; message: string };
 
+export interface SavedGame {
+  moves: [Square, Square][];
+  result: GameResult | null;
+}
+
 const SYMBOL: Record<PieceType, string> = { K: 'k', A: 'a', E: 'e', H: 'h', R: 'r', C: 'c', P: 'p' };
 
 function positionKey(board: Board, turn: Color): string {
@@ -58,6 +63,22 @@ export class XiangqiGame {
     g.turn = turn;
     g.positions = [positionKey(board, turn)];
     g.inCheck = isInCheck(board, turn) ? turn : null;
+    return g;
+  }
+
+  /** Compact save format: the moves played plus the result (resignations/forfeits can't be replayed). */
+  toJSON(): SavedGame {
+    return { moves: this.history.map((m) => [m.from, m.to]), result: this.result };
+  }
+
+  /** Rebuild a game by replaying its moves through the rules, so a corrupt save can't create an illegal position. */
+  static fromJSON(saved: SavedGame): XiangqiGame {
+    const g = new XiangqiGame();
+    for (const [from, to] of saved.moves) {
+      const outcome = g.move(g.turn, from, to);
+      if (!outcome.ok) throw new Error(`saved game contains an illegal move ${from}→${to}`);
+    }
+    if (!g.result && saved.result) g.finish(saved.result.winner, saved.result.reason);
     return g;
   }
 

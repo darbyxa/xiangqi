@@ -6,7 +6,9 @@ import express from 'express';
 import { Server } from 'socket.io';
 import type { ClientToServerEvents, ServerToClientEvents } from '../../shared/protocol';
 import { makeOriginMatcher, type Config } from './config';
+import { WebPush } from './push/WebPush';
 import { RoomService } from './rooms/RoomService';
+import { RoomStore } from './rooms/RoomStore';
 import { makeNotifier, registerHandlers } from './socket/registerHandlers';
 
 export function createGameServer(config: Config) {
@@ -29,7 +31,23 @@ export function createGameServer(config: Config) {
     pingTimeout: 10_000,
   });
 
-  const service = new RoomService(config, makeNotifier(io));
+  // Push needs somewhere to keep its keys; without a data dir it is simply off.
+  let webPush: WebPush | null = null;
+  if (config.push && config.dataDir) {
+    try {
+      webPush = new WebPush(config.dataDir, config.vapidSubject, (endpoint) => service.dropPushEndpoint(endpoint));
+    } catch (err) {
+      console.error('[push] disabled:', err);
+    }
+  }
+  app.get('/api/push/key', (_req, res) => {
+    if (webPush) res.json({ publicKey: webPush.publicKey });
+    else res.status(404).json({ error: 'Push notifications are turned off on this server.' });
+  });
+
+  const service = new RoomService(config, makeNotifier(io, webPush ? (subs, msg) => webPush.send(subs, msg) : undefined));
+  const store = config.dataDir ? new RoomStore(config.dataDir, service) : null;
+  const restored = store?.attach() ?? 0;
   registerHandlers(io, service);
 
   // Optionally serve the production build of the React app from the same port,
@@ -61,9 +79,10 @@ export function createGameServer(config: Config) {
 
   async function close(): Promise<void> {
     clearInterval(sweeper);
+    store?.close();
     service.dispose();
     await new Promise<void>((resolve) => void io.close(() => resolve()));
   }
 
-  return { app, httpServer, io, service, close };
+  return { app, httpServer, io, service, close, restored };
 }
