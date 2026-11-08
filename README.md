@@ -14,6 +14,7 @@ React + TypeScript client · Node.js + Express server · Socket.IO (WebSockets) 
 |---|---|---|
 | Windows laptop | double-click **`play_windows.bat`** | [below](#playing-between-two-laptops-with-ngrok) |
 | Android phone | `bash play_android.sh` in Termux | **[README-ANDROID.md](README-ANDROID.md)** |
+| Oracle Cloud VM (free, always on, no ngrok) | `bash deploy/oracle/setup.sh` on the VM | **[README-HOSTING.md](README-HOSTING.md)** |
 
 One device hosts. The script installs what's missing (Node.js, ngrok), builds the game, starts the server and an
 ngrok tunnel, then prints a link and a QR code. The other player only needs a browser: phone ↔ phone,
